@@ -1,0 +1,334 @@
+---
+title: "Samples implementation"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+This is a document about implementing waterlevels into a SQL database and derive groundwater depths from them.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rodm2)
+library(RSQLite)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(magrittr)
+library(tidyr)
+```
+
+To start, connect to an existing database/create new database 
+
+```{r}
+
+db <- DBI::dbConnect(RSQLite::SQLite(), "DRIP_database.sqlite")
+```
+
+First we setup the metadata of the well infrastructure. In Step 2 we will implement water level timeseries and in Step 3 we calculate groundwater depths based on the water level timeseries and the well metadata. Then in step 4 we add manual measurements of groundwater depth. These are useful for quality checking the timeseries of step 3, but we will not do the actual quality checking here.
+
+Before we begin with step 1, it is also good to know what we need fto implement any timeseries and measurements of groundwater levels into the database. The DB needs to know what the methods were used, which variables there are and which datums/references to the ground surface we have. The DB also needs to know to which sites the data belongs to. The wells can already be implemented as sites, or if they are new wells they will be added as sites automatically. To be able to request data from wells that are related to each other it is possible to define which wells have certain relationships. This workflow does not involve defining relationships between wells, see the sites implementation workflow. 
+
+##Step 1 Well infrastructure
+
+In the process of informing the DB about the well network we will implement measurements as variables and we will derive variables as well based on those measurements. For example we implement the measurements of the total length of the well (named Gage height) and the measured length of the well that is above the ground surface (offset). The variable that we  will derive is the well depth (body length), which is the total well length minus the part that is above the ground (Gage height - offset).
+
+To begin we read in the well names and the measurements of total gage height and their offset aboveground.
+
+```{r}
+well_infra <- readxl::read_xlsx( 'data/gw-well-properties/well_metadata.xlsx',col_names = T,skip=1)%>%
+  dplyr::select(DateTime, SampleFeatureCode, well_depth_to_well_top,well_top_to_surface)%>%
+  rename(Timestamp=DateTime)
+
+knitr::kable(well_infra[c(1,2),])
+
+```
+
+Now that we have the dataframes prepared for implementation into the database, we define the variables list for measurements we want to insert in the DB. This is important to associate the implemented data with a certain variable that exists in the controlled variable list, and a unit that belongs to said variable.
+
+This code will open a window where you can select the variables and the units
+```{r, eval=FALSE}
+vars_list_infra <- make_vars_list(data = well_infra[,c(3,4)]) 
+
+#choose Gage height and mm for the  well_depth_to_well_top column
+
+#choose Offset and mm for the well_top_to_surface column
+```
+
+
+optional:
+if not yet implemented, describe the methods that was used to obtain the well depths. You can check which methods are already described using the db_get_methods(db) command. Be sure to use ODM2 controlled vocabulary for any argument that ends with cv.
+
+```{r}
+# db_get_methods(db)
+
+# db_describe_method(db = db,methodname = "length measurement" ,methodtypecv = "observation",methodcode = "ruler",methoddescription = "Length measurement, e.g. depth to groundwater from a datum, total length of a object, etc.")
+
+```
+
+Now we insert the data into the DB. We define in which dataframe the datavalues are found, the variables list that defines from which columns the data should be taken from. Then we define the method, medium, the column name where the site codes are found in the dataframe (exact column name), and the processing level.
+```{r}
+db_insert_results_m(db = db,
+                          datavalues = well_infra, 
+                          variables = vars_list_infra,
+                          method="ruler",
+                          sampledmedium = "notApplicable",
+                          site_code_col = "SampleFeatureCode",
+                          processinglevel = "Raw data")
+
+```
+
+Now that the well infrastructure data is implemented we can check if it is there by performing a query
+
+```{r}
+well_data_pull <-dbGetQuery(db, "SELECT datavalue, res.resultid, var.variablenamecv, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM measurementresultvalues mrv
+INNER JOIN results res ON mrv.resultid = res.resultid
+INNER JOIN variables var ON res.variableid = var.variableid
+INNER JOIN featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN actions acts ON acts.actionid = fa.actionid
+INNER JOIN units units ON units.unitsid = res.unitsid
+INNER JOIN methods meth ON meth.methodid = acts.methodid WHERE VariableNameCV IN ('Offset','Gage height')") 
+
+
+knitr::kable(well_data_pull[c(1,2),])
+
+
+
+```
+
+
+Since we have the gage height and offset from the DB, we will mutate it to well depth
+```{r}
+well_data_pull%<>%
+  dplyr::select(SamplingFeatureCode, VariableNameCV, DataValue, ValueDateTime)%>%
+  spread(key = VariableNameCV,value = DataValue,fill = NA)%>%
+  mutate(wellDepth = `Gage height` - Offset)%>%
+  dplyr::select(SamplingFeatureCode,ValueDateTime,wellDepth) %>% 
+  rename(Timestamp=ValueDateTime)
+
+
+
+```
+
+The variables well length and offset were already defined in the DB as gage height and offset, but the derived  well depth variable has to be defined seperately. This is done as follows:
+```{r}
+db_describe_variable(db = db,
+                     variabletypecv = "Hydrology",
+                     variablenamecv = "bodyLength",
+                     variablecode = "welldepth",
+                     variabledefinition = "total length of well tubing (gage height) minus offset above ground surface")
+```
+we still have to use a controlled variable term, and bodyLength is the most fitting. It is possible to use CV variables for several terms, but to avoid confusion when querying for data, we make sure they are different in this example.
+
+
+With the derived well depth ready, we again implement it into the DB. We define again which columns we want to implement using the variables list and if needed we desribe the method of the derivation we just did.
+```{r}
+
+vars_derived<-make_vars_list(data = well_data_pull[,c(2,3)])
+
+# db_describe_method(db,methodname = "Well depth calculation",methodtypecv = "Derivation",methoddescription = "wellDepth = `Gage height` - Offset", methodcode = "WellCal")
+
+db_insert_results_m(db,
+                    datavalues = well_data_pull,
+                    method ="WellCal",
+                    site_code_col = "SamplingFeatureCode",
+                    variables = vars_derived,
+                    sampledmedium = "Equipment",
+                    processinglevel = "Derived product")
+```
+
+Again we can query the well depth data we just inserted and compare it with the datavalues we would derive from the initial datafile.
+```{r}
+#Check if results are inserted
+well_depths_from_db <- dbGetQuery(db, "SELECT datavalue, res.resultid, var.variablenamecv, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM measurementresultvalues mrv
+INNER JOIN results res ON mrv.resultid = res.resultid
+INNER JOIN variables var ON res.variableid = var.variableid
+INNER JOIN featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN actions acts ON acts.actionid = fa.actionid
+INNER JOIN units units ON units.unitsid = res.unitsid
+INNER JOIN methods meth ON meth.methodid = acts.methodid WHERE VariableNameCV IN ('Body length')")
+knitr::kable(well_depths_from_db[c(1,2),c(1,5,6)])
+
+well_infra %>% 
+  mutate(DataValue = well_depth_to_well_top - well_top_to_surface) %>% 
+  rename(ValueDateTime = Timestamp) %>% 
+  dplyr::select(DataValue,ValueDateTime, SampleFeatureCode) %>% 
+  head(2) %>% 
+knitr::kable()
+
+```
+
+
+##Step 2 Implement water level timeseries
+
+We read in the water level timeseries of one site, in a more advanced stage (not this workflow) we can automate this for an entire folder of water level data as long as format and filenames are consistent.
+
+We prepare the timeseries, define the variables list of columns we want to implement and then insert the results. It is possible to implement simultaneously other variables that are in the file, such as water temperature or battery voltage. 
+```{r}
+# filename <- 'data/gw-level/2019-07-02-1146_510r1_0906283.xlsx'
+# ts_waterlevel<-readxl::read_xlsx(filename,skip =11)%>%
+#   dplyr::select(2,5)%>%
+#   rename(Timestamp=`24hr`, Waterheight=mm)
+
+filename <- 'data/gw-level/Omnilog 509r2.csv'
+ts_waterlevel<-read.csv(filename,skip =11,stringsAsFactors = F)%>%
+  dplyr::select(2,6)%>%
+  rename(Timestamp=1, Waterheight=2) %>% 
+  mutate(Timestamp = parse_date_time(Timestamp,orders = "dmy HM"))
+# db_describe_method(db = db,methodname = "Trutrack" ,methodtypecv = "dataRetrieval",methodcode = "Trutrack",methoddescription = "data retrieval from Trutrack logger")
+
+#Use the variable name Water level and unit millimeter
+vars_ts_waterlevel<-make_vars_list(data = ts_waterlevel)
+
+db_insert_results_ts(db = db,
+                     datavalues = ts_waterlevel,
+                     method = "Trutrack",
+                     methodtypecv = "dataRetrieval",
+                     site_code = "509R2",
+                     variables = vars_ts_waterlevel,
+                     sampledmedium = "liquidAqueous")
+```
+
+See if the water level timeseries is in the DB
+```{r}
+db_get_water_level_ts(db,site_code = '509R2')
+
+# or
+
+dbGetQuery(db, "SELECT datavalue, res.resultid, var.variablenamecv, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM timeseriesresultvalues mrv
+INNER JOIN results res ON mrv.resultid = res.resultid
+INNER JOIN variables var ON res.variableid = var.variableid
+INNER JOIN featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN actions acts ON acts.actionid = fa.actionid
+INNER JOIN units units ON units.unitsid = res.unitsid
+INNER JOIN methods meth ON meth.methodid = acts.methodid WHERE VariableNameCV IN ('Water level')") %>% 
+head(2) %>% 
+knitr::kable()
+
+```
+
+##Step 3 Derive groundwater depth timeseries
+
+Now we combine the well depth information from step 1 and the timeseries from step 2 to derive a groundwater depth timeseries.
+
+First we again describe the variable to which we assign timeseries of calculated groundwater depth. 
+
+```{r}
+db_describe_variable(db = db,
+                     variabletypecv = "Hydrology",
+                     variablenamecv = "groundwaterDepth",
+                     variablecode = "groundwaterDepth_ts",
+                     variabledefinition = "timeseries of groundwater depth based on waterlevel and the well depth relative to ground surface")
+
+
+```
+
+These timeseries come from Trutrack loggers. The loggers rest on the bottom of the well and measure the water column from the foot of the logger upwards. Therefore the bottom of the well is used as datum/reference instead of the ground surface. In order to derive groundwater depth we have to substract the waterlevel (step 2) from the well depth relative to the surface (step 1).
+
+We can either use the db water level timeseries and the well depth from the db:
+```{r}
+waterlevel_ts <-dbGetQuery(db, "SELECT datavalue, res.resultid, var.variablenamecv, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM timeseriesresultvalues mrv
+INNER JOIN results res ON mrv.resultid = res.resultid
+INNER JOIN variables var ON res.variableid = var.variableid
+INNER JOIN featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN actions acts ON acts.actionid = fa.actionid
+INNER JOIN units units ON units.unitsid = res.unitsid
+INNER JOIN methods meth ON meth.methodid = acts.methodid WHERE VariableNameCV IN ('Water level')")
+
+well_depths_from_db <- dbGetQuery(db, "SELECT datavalue, res.resultid, var.variablenamecv, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM measurementresultvalues mrv
+INNER JOIN results res ON mrv.resultid = res.resultid
+INNER JOIN variables var ON res.variableid = var.variableid
+INNER JOIN featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN actions acts ON acts.actionid = fa.actionid
+INNER JOIN units units ON units.unitsid = res.unitsid
+INNER JOIN methods meth ON meth.methodid = acts.methodid WHERE VariableNameCV IN ('Body length')")
+```
+
+Or the water level timeseries that we still have in our environment
+```{r}
+knitr::kable(ts_waterlevel[c(1,2),])
+
+ts_waterlevel %>% 
+  mutate(SamplingFeatureCode = "509R2") %>% 
+  left_join(well_depths_from_db, by='SamplingFeatureCode') %>% 
+  rename(Welldepth = DataValue, Waterlevel = Waterheight)%>% 
+  dplyr::select(Timestamp, Waterlevel, Welldepth) %>% 
+  mutate(gw_depth_ts= Welldepth - Waterlevel)
+  
+
+
+```
+
+
+```{r}
+waterlevel_ts %<>% 
+  left_join(well_depths_from_db, by='SamplingFeatureCode') %>% 
+  dplyr::select(ValueDateTime.x,DataValue.x,DataValue.y,SamplingFeatureCode) %>% 
+  rename(Waterlevel=DataValue.x, Welldepth = DataValue.y) %>% 
+  mutate(gw_depth_ts= Welldepth - Waterlevel)%>% 
+  dplyr::select(ValueDateTime.x,gw_depth_ts) %>% 
+  rename(Timestamp= ValueDateTime.x) %>% 
+  mutate(Timestamp = ymd_hms(Timestamp))
+
+
+db_describe_method(db,methodname = "Groundwater depth calculation",methodtypecv = "Derivation",methoddescription = "Groundwater Depth = Well depth - Water level", methodcode = "GWCal")
+
+vars<-make_vars_list(data = waterlevel_ts)
+
+db_insert_results_ts(db,
+                    datavalues = waterlevel_ts,
+                    method ="GWCal",
+                    site_code = "509R2",
+                    variables = vars,
+                    sampledmedium = "liquidAqueous",
+                    processinglevel = "Derived product")
+
+
+check_gw <-dbGetQuery(db, "SELECT datavalue, res.resultid, var.variablenamecv, units.unitsname, valuedatetime, sf.samplingfeaturecode, meth.methodcode
+FROM timeseriesresultvalues mrv
+INNER JOIN results res ON mrv.resultid = res.resultid
+INNER JOIN variables var ON res.variableid = var.variableid
+INNER JOIN featureactions fa ON res.featureactionid = fa.featureactionid
+INNER JOIN samplingfeatures sf ON sf.samplingfeatureid = fa.samplingfeatureid
+INNER JOIN actions acts ON acts.actionid = fa.actionid
+INNER JOIN units units ON units.unitsid = res.unitsid
+INNER JOIN methods meth ON meth.methodid = acts.methodid WHERE Methodcode = 'GWCal'")
+
+plot(ymd_hms(check_gw$ValueDateTime),check_gw$DataValue, ylim=c(1500,-250))
+abline(h=T)
+
+```
+
+
+##Step 4
+Finally we will insert the manual measurements of groundwater levels.
+
+Describe the variable to which we assign manual measurements of groundwater depth from the top of the well casing. This data can be used to correct timeseries but still should be corrected for the part of the well case that is sticking out from the ground (offset)
+```{r}
+db_describe_variable(db = db,
+                     variabletypecv = "Hydrology",
+                     variablenamecv = "depth",
+                     variablecode = "manual_gw_depth_uncorrected",
+                     variabledefinition = "uncorrected manual depth measurement of groundwater from well top(offset)")
+```
+
+Describe the variable to which we assign manual measurements of groundwater depth that we corrected for the offset
+```{r}
+db_describe_variable(db = db,
+                     variabletypecv = "Hydrology",
+                     variablenamecv = "groundwaterDepth",
+                     variablecode = "groundwaterDepth_ms",
+                     variabledefinition = "manual depth measurement of groundwater depth corrected for offset")
+```
+
+
